@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"math/rand"
+	"sync/atomic"
 	"testing"
 )
 
@@ -200,5 +201,163 @@ func TestLeopardGF16ReconstructGolden(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// goldenParallelWorkers lists the WithReconstructWorkers callbacks the
+// parallel golden runs: fixed counts that span one lane up to well past the
+// lane cap, and one whose answer changes every call. Each entry builds a fresh
+// callback so a changing one starts from a known state per encoder.
+var goldenParallelWorkers = []struct {
+	name    string
+	workers func() func() int
+}{
+	{"2", func() func() int { return func() int { return 2 } }},
+	{"3", func() func() int { return func() int { return 3 } }},
+	{"16", func() func() int { return func() int { return 16 } }},
+	{"max", func() func() int { return func() int { return 1 << 20 } }},
+	{"changing", func() func() int {
+		var calls atomic.Int32
+		return func() int { return []int{1, 16, 3, 5, 2}[calls.Add(1)%5] }
+	}},
+}
+
+// TestLeopardGF16ReconstructDataParallelGolden checks that constructing the
+// decoder with WithReconstructWorkers, so ReconstructData and Reconstruct
+// spread the column chunks over goroutines sharing one work set, keeps the
+// pinned single-goroutine digests. It runs each worker callback across the
+// NEON, noNEON and arch (noSHA3) variants; run it under -race.
+func TestLeopardGF16ReconstructDataParallelGolden(t *testing.T) {
+	variants := []struct {
+		name string
+		opts []Option
+		fast bool
+	}{
+		{"default", nil, true},
+		{"noNEON", []Option{WithNEON(false)}, false},
+	}
+	variants = append(variants, goldenArchVariants()...)
+	for _, sh := range goldenReconstructShapes {
+		if testing.Short() && sh.size > 4096 {
+			continue
+		}
+		shards := goldenShards(sh.data, sh.parity, sh.size, false)
+		enc, err := New(sh.data, sh.parity, WithLeopardGF16(true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.Encode(shards); err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range variants {
+			for _, w := range goldenParallelWorkers {
+				// -short budget: under -short every shape has only two lanes, so
+				// the fixed worker counts all clamp to the same want; keep one
+				// of them plus the changing callback (which varies concurrency
+				// and spawns goroutines mid-reconstruct). The large shard counts
+				// (n up to 32768) dominate -race time, so for those run just the
+				// default kernel with the changing callback. A full (non-short)
+				// run exercises every variant, every fixed count, and the
+				// many-lane shapes where the counts diverge.
+				if testing.Short() {
+					if sh.data+sh.parity > 4096 {
+						if v.name != "default" || w.name != "changing" {
+							continue
+						}
+					} else if w.name != "16" && w.name != "changing" {
+						continue
+					}
+				}
+				opts := append([]Option{WithLeopardGF16(true), WithReconstructWorkers(w.workers())}, v.opts...)
+				dec, err := New(sh.data, sh.parity, opts...)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for ei, e := range goldenErasures {
+					rng := rand.New(rand.NewSource(int64(sh.data*7919 + sh.parity*31 + ei)))
+					keep := e.keep(sh.data, sh.parity, rng)
+					for _, all := range []bool{false, true} {
+						in := goldenErased(shards, keep, rng)
+						want := sh.dataDigests[ei]
+						if all {
+							err = dec.Reconstruct(in)
+							want = sh.allDigests[ei]
+						} else {
+							err = dec.ReconstructData(in)
+							in = in[:sh.data]
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						if got := goldenDigestAll(in); got != want {
+							t.Errorf("%d+%d size=%d %s %s workers=%s all=%v: digest %s, want %s", sh.data, sh.parity, sh.size, v.name, e.name, w.name, all, got, want)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestLeopardGF16ReconstructDataUnsetAllocs guards the WithReconstructWorkers
+// unset path against the escaping-laneScheduler regression. The shared-lanes
+// change first built the laneScheduler and its run closure unconditionally, and
+// the closure captured &errLocs and &errorBits; escape analysis then moved
+// errLocs (an [order]ffe, 128 KiB), errorBits, the scheduler and the closure to
+// the heap on every ReconstructData, even with workers unset. The unset path
+// now runs the original in-caller loop and keeps errLocs on the stack, so it
+// allocates only what the pre-shared-lanes (28-zero-aware-tail) decoder did.
+//
+// The shape is small but chunked (chunkSize < shardSize) so the full chunk loop
+// runs, and a fixed work allocator keeps the legitimate per-call work-set
+// allocation out of the count. Warm allocs on the pre-shared-lanes decoder are
+// 9/op here (bytes/op ~49.5 KiB); the regression raised that to 12/op and
+// ~181 KiB as the 128 KiB errLocs moved to the heap. The bound below sits just
+// above the restored baseline and well under the regressed figure.
+func TestLeopardGF16ReconstructDataUnsetAllocs(t *testing.T) {
+	const data, parity, size = 128, 128, 96 << 10
+	// maxAllocs documents the baseline: the pre-shared-lanes decoder did 9
+	// allocs/op for this shape; the escaping-scheduler bug made it 12.
+	const maxAllocs = 11
+	enc, err := New(data, parity, WithLeopardGF16(true), WithWorkAllocator(&fixedWorkAllocator{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shards := AllocAligned(data+parity, size)
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < data; i++ {
+		rng.Read(shards[i])
+	}
+	if err := enc.Encode(shards); err != nil {
+		t.Fatal(err)
+	}
+	// Keep exactly data shards, all from parity: the worst case for the FFT
+	// reconstruct and, at this shape, chunked.
+	keep := make([]bool, data+parity)
+	for i := data; i < 2*data; i++ {
+		keep[i] = true
+	}
+	work := make([][]byte, len(shards))
+	reset := func() {
+		for i := range shards {
+			if keep[i] {
+				work[i] = shards[i]
+			} else {
+				work[i] = shards[i][:0]
+			}
+		}
+	}
+	reset()
+	if err := enc.ReconstructData(work); err != nil { // warm the slice pools
+		t.Fatal(err)
+	}
+	got := testing.AllocsPerRun(20, func() {
+		reset()
+		if err := enc.ReconstructData(work); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got > maxAllocs {
+		t.Errorf("unset ReconstructData: %.0f allocs/op, want <= %d; the 128 KiB errLocs or the laneScheduler/closure is escaping on the unset path", got, maxAllocs)
 	}
 }

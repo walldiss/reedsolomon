@@ -493,11 +493,56 @@ func (r *leopardFF16) reconstruct(shards [][]byte, recoverAll bool) error {
 	m := ceilPow2(r.parityShards)
 	n := ceilPow2(m + r.dataShards)
 
+	chunkSize := encodeChunkSize(shardSize, n, &r.o)
+
+	work, err := getWork(r.workAlloc, n, chunkSize)
+	if err != nil {
+		return err
+	}
+	defer r.workAlloc.Put(work)
+
+	// sh preserves the original nil entries so reconstructChunk can
+	// distinguish present vs missing shards after pre-allocation.
+	sh := r.getShardSlice()
+	defer r.putShardSlice(sh)
+	copy(sh, shards)
+
+	// Pre-allocate missing output shards.
+	end := r.dataShards
+	if recoverAll {
+		end = r.totalShards
+	}
+	for i := 0; i < end; i++ {
+		if len(shards[i]) != 0 {
+			continue
+		}
+		if cap(shards[i]) >= shardSize {
+			shards[i] = shards[i][:shardSize]
+		} else {
+			shards[i] = make([]byte, shardSize)
+		}
+	}
+
+	// With WithReconstructWorkers unset the work runs in the calling goroutine
+	// exactly as before: reconstructSerial keeps errLocs and errorBits on its
+	// own stack and never leaks them, so the unset path adds no allocations over
+	// the pre-shared-lanes decoder. Only reconstructParallel builds the
+	// laneScheduler and the escaping closure, so only the opt-in path pays for
+	// them.
+	if r.o.reconstructWorkers == nil {
+		return r.reconstructSerial(sh, shards, work, m, n, shardSize, chunkSize, useBits, recoverAll)
+	}
+	return r.reconstructParallel(r.o.reconstructWorkers, sh, shards, work, m, n, shardSize, chunkSize, useBits, recoverAll)
+}
+
+// errorLocator fills errLocs and errorBits from the present shards and returns
+// the input count. It reads and writes only through the pointers and never
+// stores them, so neither escapes; the serial and parallel paths each pass
+// their own stack-local errLocs (an [order]ffe, 128 KiB) and errorBits.
+func (r *leopardFF16) errorLocator(shards [][]byte, m, n int, useBits, recoverAll bool, errLocs *[order]ffe, errorBits *errorBitfield) int {
 	const LEO_ERROR_BITFIELD_OPT = true
 
 	// Fill in error locations.
-	var errorBits errorBitfield
-	var errLocs [order]ffe
 	inputCount := r.parityShards
 	for i := 0; i < r.parityShards; i++ {
 		if len(shards[i+r.dataShards]) == 0 {
@@ -529,43 +574,27 @@ func (r *leopardFF16) reconstruct(shards [][]byte, recoverAll bool) error {
 	}
 
 	// Evaluate error locator polynomial
-	fwht(&errLocs, m+r.dataShards)
+	fwht(errLocs, m+r.dataShards)
 
 	for i := range order {
 		errLocs[i] = ffe((uint(errLocs[i]) * uint(logWalsh[i])) % modulus)
 	}
 
-	fwht(&errLocs, order)
+	fwht(errLocs, order)
+	return inputCount
+}
 
-	chunkSize := encodeChunkSize(shardSize, n, &r.o)
-
-	work, err := getWork(r.workAlloc, n, chunkSize)
-	if err != nil {
-		return err
-	}
-	defer r.workAlloc.Put(work)
-
-	// sh preserves the original nil entries so reconstructChunk can
-	// distinguish present vs missing shards after pre-allocation.
-	sh := r.getShardSlice()
-	defer r.putShardSlice(sh)
-	copy(sh, shards)
-
-	// Pre-allocate missing output shards.
-	end := r.dataShards
-	if recoverAll {
-		end = r.totalShards
-	}
-	for i := 0; i < end; i++ {
-		if len(shards[i]) != 0 {
-			continue
-		}
-		if cap(shards[i]) >= shardSize {
-			shards[i] = shards[i][:shardSize]
-		} else {
-			shards[i] = make([]byte, shardSize)
-		}
-	}
+// reconstructSerial runs the reconstruct pipeline in the calling goroutine,
+// the behaviour when WithReconstructWorkers is unset. errLocs and errorBits are
+// stack locals here; they flow only to errorLocator and reconstructChunk, which
+// never leak them, so this path keeps them on the stack and allocates nothing
+// beyond what the pre-shared-lanes decoder did.
+func (r *leopardFF16) reconstructSerial(sh, shards, work [][]byte, m, n, shardSize, chunkSize int, useBits, recoverAll bool) error {
+	var errorBits errorBitfield
+	var errLocs [order]ffe
+	// sh snapshots shard presence before reconstruct pre-allocated the missing
+	// output shards, so errorLocator sees the original missing (len 0) entries.
+	inputCount := r.errorLocator(sh, m, n, useBits, recoverAll, &errLocs, &errorBits)
 
 	if chunkSize >= shardSize {
 		r.reconstructChunk(sh, shards, work, m, n, inputCount, &errLocs, useBits, &errorBits, recoverAll)
@@ -605,6 +634,151 @@ func (r *leopardFF16) reconstruct(shards [][]byte, recoverAll bool) error {
 		r.reconstructChunk(shChunk, outChunk, work, m, n, inputCount, &errLocs, useBits, &errorBits, recoverAll)
 	}
 	return nil
+}
+
+// reconstructParallel spreads the reconstruct's column blocks over goroutines
+// that share one work set, the behaviour when WithReconstructWorkers is set. The
+// laneScheduler's run closure captures errLocs and errorBits and escapes to the
+// spawned goroutines, so both move to the heap here; that allocation is the
+// opt-in cost of the parallel path and never burdens the unset path.
+func (r *leopardFF16) reconstructParallel(workers func() int, sh, shards, work [][]byte, m, n, shardSize, chunkSize int, useBits, recoverAll bool) error {
+	var errorBits errorBitfield
+	var errLocs [order]ffe
+	// sh snapshots shard presence before reconstruct pre-allocated the missing
+	// output shards, so errorLocator sees the original missing (len 0) entries.
+	inputCount := r.errorLocator(sh, m, n, useBits, recoverAll, &errLocs, &errorBits)
+
+	lanes := max(min(chunkSize/minLaneSize, maxLanes), 1)
+	s := &laneScheduler{shardSize: shardSize, laneSize: chunkSize / lanes &^ 63, lanes: lanes, free: uint64(1)<<lanes - 1, workers: workers, running: 1}
+	s.cond.L = &s.mu
+	s.run = func() {
+		r.reconstructLanes(s, sh, shards, work, m, n, inputCount, &errLocs, useBits, &errorBits, recoverAll)
+	}
+	s.mu.Lock()
+	s.spawn()
+	s.mu.Unlock()
+	s.run()
+	s.wg.Wait()
+	return nil
+}
+
+// Lanes carve the work columns among concurrent goroutines. A lane is at
+// least minLaneSize wide, so a work chunk has at most maxLanes of them.
+const (
+	minLaneSize = 1 << 10
+	maxLanes    = 32
+)
+
+// laneScheduler hands column blocks of a reconstruct to goroutines. Each
+// block gets an aligned power-of-two group of lanes sized by the workers
+// callback, so a lone goroutine sweeps the whole chunk at once and more
+// goroutines start as the callback allows.
+type laneScheduler struct {
+	shardSize, laneSize, lanes int
+	workers                    func() int
+	run                        func() // one goroutine's loop over claimed blocks
+
+	mu      sync.Mutex
+	cond    sync.Cond
+	next    int    // first unclaimed column
+	free    uint64 // bit i set: lane i is free
+	running int    // goroutines in run, the caller included
+	wg      sync.WaitGroup
+}
+
+// want reports the goroutine count the callback allows, clamped to the lanes.
+func (s *laneScheduler) want() int {
+	if s.workers == nil {
+		return 1
+	}
+	return max(min(s.workers(), s.lanes), 1)
+}
+
+// spawn starts goroutines until running matches want. Caller holds mu.
+func (s *laneScheduler) spawn() {
+	for want := s.want(); s.running < want && s.next < s.shardSize; {
+		s.running++
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.run()
+		}()
+	}
+}
+
+// claim reserves the next column block and k lanes from lane for it. It
+// returns false when no columns remain or the caller should stop to match
+// want.
+func (s *laneScheduler) claim() (off, end, lane, k int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		if s.next >= s.shardSize {
+			return 0, 0, 0, 0, false
+		}
+		want := s.want()
+		if s.running > want {
+			s.running--
+			return 0, 0, 0, 0, false
+		}
+		k = 1
+		for k*2 <= s.lanes/want {
+			k *= 2
+		}
+		for ; k > 0; k /= 2 {
+			mask := uint64(1)<<k - 1
+			for i := 0; i+k <= s.lanes; i += k {
+				if s.free&(mask<<i) == mask<<i {
+					s.free &^= mask << i
+					off = s.next
+					end = min(off+k*s.laneSize, s.shardSize)
+					s.next = end
+					return off, end, i, k, true
+				}
+			}
+		}
+		s.cond.Wait()
+	}
+}
+
+// release frees k lanes from lane and starts goroutines if want grew.
+func (s *laneScheduler) release(lane, k int) {
+	s.mu.Lock()
+	s.free |= (uint64(1)<<k - 1) << lane
+	s.spawn()
+	s.mu.Unlock()
+	s.cond.Broadcast()
+}
+
+// reconstructLanes runs the chunk pipeline over the blocks s hands out,
+// using the block's lanes of work as scratch.
+func (r *leopardFF16) reconstructLanes(s *laneScheduler, sh, shards, work [][]byte, m, n, inputCount int, errLocs *[order]ffe, useBits bool, errorBits *errorBitfield, recoverAll bool) {
+	wMod := r.getWorkSlice(len(work))
+	defer r.putWorkSlice(wMod)
+	shChunk := r.getShardSlice()
+	defer r.putShardSlice(shChunk)
+	outChunk := r.getShardSlice()
+	defer r.putShardSlice(outChunk)
+	for {
+		off, end, lane, k, ok := s.claim()
+		if !ok {
+			return
+		}
+		col := lane * s.laneSize
+		for i := range work {
+			wMod[i] = work[i][col : col+end-off]
+		}
+		for i := range shards {
+			if len(sh[i]) != 0 {
+				shChunk[i] = shards[i][off:end]
+			}
+			if len(shards[i]) != 0 {
+				outChunk[i] = shards[i][off:end]
+			}
+		}
+		r.reconstructChunk(shChunk, outChunk, wMod, m, n, inputCount, errLocs, useBits, errorBits, recoverAll)
+		s.release(lane, k)
+	}
 }
 
 // reconstructChunk processes one chunk of the reconstruct pipeline.

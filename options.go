@@ -37,6 +37,7 @@ type options struct {
 	customMatrix         [][]byte
 	withLeopard          leopardMode
 	workAlloc            WorkAllocator
+	reconstructWorkers   func() int
 
 	// stream options
 	concReads  bool
@@ -352,6 +353,32 @@ func WithLeopardGF(enabled bool) Option {
 func WithWorkAllocator(alloc WorkAllocator) Option {
 	return func(o *options) {
 		o.workAlloc = alloc
+	}
+}
+
+// WithReconstructWorkers sets a callback that governs how many goroutines the
+// Leopard GF16 reconstruct path may use. When set, ReconstructData spreads a
+// single reconstruct's column chunks over up to that many goroutines that
+// share one work set, so peak work memory stays that of a single call while
+// otherwise-idle CPU is put to use. Reconstruct (recoverAll) uses the same
+// scheduler and is covered too, as is the general ReconstructSome.
+//
+// workers is polled as column chunks finish, so the parallelism tracks what
+// the caller can spare over the life of a single call. It is invoked from
+// inside the scheduler while an internal lock is held, so it must be cheap and
+// must not re-enter the encoder (no reentrancy). Its result is clamped to
+// [1, an internal lane cap of at most 32]; a reconstruct's work columns are
+// split into at most that many lanes, and smaller shards yield fewer. A
+// callback that always returns 1 selects the single-goroutine path and is
+// byte-identical to leaving this option unset.
+//
+// When unset (or set to nil), ReconstructData and Reconstruct behave exactly
+// as before: the work runs in the calling goroutine. The option has no effect
+// on the 8-bit Leopard encoder or the Vandermonde/Cauchy encoders, and none on
+// Encode; it governs only the Leopard GF16 reconstruct path.
+func WithReconstructWorkers(workers func() int) Option {
+	return func(o *options) {
+		o.reconstructWorkers = workers
 	}
 }
 

@@ -102,6 +102,10 @@ func BenchmarkLeopardGF16Production(b *testing.B) {
 var benchReconSets struct {
 	once sync.Once
 	encs [benchWorkers]Encoder
+	// wenc is one decoder built with WithReconstructWorkers: a single
+	// ReconstructData spreads its column chunks over up to benchWorkers
+	// goroutines sharing one work set, for the parallel-scaling bench.
+	wenc Encoder
 	// in[pattern][worker] has the missing slots as len 0, cap shardSize.
 	in [2][benchWorkers][][]byte
 }
@@ -111,6 +115,12 @@ func benchReconstructSets(b *testing.B) {
 	benchProductionSets(b)
 	const data, parity, size = 4096, 12288, 32 << 10
 	benchReconSets.once.Do(func() {
+		wenc, err := New(data, parity, WithLeopardGF16(true),
+			WithReconstructWorkers(func() int { return benchWorkers }))
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchReconSets.wenc = wenc
 		for w := range benchWorkers {
 			enc, err := New(data, parity, WithLeopardGF16(true))
 			if err != nil {
@@ -151,13 +161,27 @@ func benchErase(shards [][]byte, keep []bool) [][]byte {
 }
 
 // BenchmarkLeopardGF16Reconstruct measures ReconstructData at the fibre shape
-// for the all-parity and random-K erasures, alone and with 16 decoders
-// running concurrently.
+// for the all-parity and random-K erasures. "single" is one reconstruct in the
+// calling goroutine with WithReconstructWorkers unset (the baseline the unset
+// path must not regress against); "workers" is one reconstruct that
+// WithReconstructWorkers spreads over up to benchWorkers goroutines sharing one
+// work set (parallel scaling of a single call); "conc16" runs benchWorkers
+// unset decoders concurrently.
 func BenchmarkLeopardGF16Reconstruct(b *testing.B) {
 	for pi, pat := range []string{"parity", "random"} {
 		b.Run(pat+"/single", func(b *testing.B) {
 			benchReconstructSets(b)
 			enc, in := benchReconSets.encs[0], benchReconSets.in[pi][0]
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := enc.ReconstructData(slices.Clone(in)); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run(pat+"/workers", func(b *testing.B) {
+			benchReconstructSets(b)
+			enc, in := benchReconSets.wenc, benchReconSets.in[pi][0]
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				if err := enc.ReconstructData(slices.Clone(in)); err != nil {
