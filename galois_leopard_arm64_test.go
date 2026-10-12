@@ -320,3 +320,11 @@ func TestLeopardNEONMulXor8InputAlias(t *testing.T) {
 		}
 	}
 }
+
+func goldenArchVariants() []struct {
+	name string
+	opts []Option
+	fast bool
+} {
+	return nil
+}
