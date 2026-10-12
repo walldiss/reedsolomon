@@ -354,20 +354,50 @@ func gf16Kernels() []gf16Kernel {
 	refMulXor := func(x, y []byte, logM ffe) { refMulAdd(x, y, logM) }
 	refFFT := func(x, y []byte, logM ffe) { refMulAdd(x, y, logM); sliceXorGo(x, y, nil) }
 	refIFFT := func(x, y []byte, logM ffe) { sliceXorGo(x, y, nil); refMulAdd(x, y, logM) }
+	refSplit := func(x, y []byte, logM ffe) { copy(y, x); refMulAdd(x, y, logM) }
 	ks := []gf16Kernel{
 		{"mulgf16NEON", mulgf16NEON, func(x, y []byte, logM ffe) { refMul(x, y, logM) }},
 		{"mulgf16XorNEON", mulgf16XorNEON, refMulXor},
 		{"fftDIT2NEON", fftDIT2NEON, refFFT},
 		{"ifftDIT2NEON", ifftDIT2NEON, refIFFT},
+		{"splitMulXorNEON", splitMulXorNEON, refSplit},
 	}
 	if defaultOptions.useSHA3 {
 		ks = append(ks,
 			gf16Kernel{"mulgf16XorNEON3", mulgf16XorNEON3, refMulXor},
 			gf16Kernel{"fftDIT2NEON3", fftDIT2NEON3, refFFT},
 			gf16Kernel{"ifftDIT2NEON3", ifftDIT2NEON3, refIFFT},
+			gf16Kernel{"splitMulXorNEON3", splitMulXorNEON3, refSplit},
 		)
 	}
 	return ks
+}
+
+// TestLeopardSplitMulXor checks the dispatching wrapper, including the
+// modulus (copy-only) case and tails shorter than a NEON block.
+func TestLeopardSplitMulXor(t *testing.T) {
+	initConstants()
+	rng := rand.New(rand.NewSource(12))
+	for _, sha3 := range []bool{false, true} {
+		o := defaultOptions
+		o.useSHA3 = sha3 && defaultOptions.useSHA3
+		for _, n := range []int{0, 2, 64, 66, 1024, 1026, 4096} {
+			for _, logM := range []ffe{0, 1, 1234, modulus - 1, modulus} {
+				x, y := make([]byte, n), make([]byte, n)
+				rng.Read(x)
+				rng.Read(y)
+				wx, wy := bytes.Clone(x), bytes.Clone(y)
+				splitMulXor(x, y, logM, &o)
+				copy(wy, wx)
+				if logM != modulus {
+					refMulAdd(wx, wy, logM)
+				}
+				if !bytes.Equal(x, wx) || !bytes.Equal(y, wy) {
+					t.Fatalf("sha3=%v n=%d log_m=%d mismatch", sha3, n, logM)
+				}
+			}
+		}
+	}
 }
 
 // TestLeopardGF16KernelsVsReference checks every kernel against its
