@@ -245,3 +245,44 @@ ifft4loop:
 
 ifft4done:
 	RET
+
+// (OUTLO, OUTHI) = (LO, HI) * log_m for 16 symbols. Scratch V9-V15.
+#define MUL16_3(LO, HI, OUTLO, OUTHI) \
+	VAND  V8.B16, LO.B16, V9.B16   \
+	VUSHR $4, LO.B16, V10.B16      \
+	VAND  V8.B16, HI.B16, V11.B16  \
+	VUSHR $4, HI.B16, V12.B16      \
+	VTBL  V9.B16, [V0.B16], V13.B16  \
+	VTBL  V10.B16, [V1.B16], V14.B16 \
+	VTBL  V11.B16, [V2.B16], V15.B16 \
+	VEOR3 V13.B16, V14.B16, V15.B16, OUTLO.B16 \
+	VTBL  V12.B16, [V3.B16], V13.B16 \
+	VEOR  V13.B16, OUTLO.B16, OUTLO.B16 \
+	VTBL  V9.B16, [V4.B16], V13.B16  \
+	VTBL  V10.B16, [V5.B16], V14.B16 \
+	VTBL  V11.B16, [V6.B16], V15.B16 \
+	VEOR3 V13.B16, V14.B16, V15.B16, OUTHI.B16 \
+	VTBL  V12.B16, [V7.B16], V13.B16 \
+	VEOR  V13.B16, OUTHI.B16, OUTHI.B16
+
+// func mulgf16NEON3(x, y []byte, table *[128]uint8)
+// x = y * log_m
+TEXT ·mulgf16NEON3(SB), NOSPLIT, $0-56
+	MOVD table+48(FP), R10
+	LOAD_TABLES3(R10)
+	LOAD_MASK3
+	MOVD x_base+0(FP), R1
+	MOVD x_len+8(FP), R2
+	MOVD y_base+24(FP), R5
+	CBZ  R2, mul3done
+
+mul3loop:
+	VLD1.P 64(R5), [V16.B16, V17.B16, V18.B16, V19.B16]
+	MUL16_3(V16, V18, V24, V26)
+	MUL16_3(V17, V19, V25, V27)
+	VST1.P [V24.B16, V25.B16, V26.B16, V27.B16], 64(R1)
+	SUBS $64, R2
+	BGT  mul3loop
+
+mul3done:
+	RET

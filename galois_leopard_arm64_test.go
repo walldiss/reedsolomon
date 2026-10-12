@@ -364,6 +364,7 @@ func gf16Kernels() []gf16Kernel {
 	}
 	if defaultOptions.useSHA3 {
 		ks = append(ks,
+			gf16Kernel{"mulgf16NEON3", mulgf16NEON3, func(x, y []byte, logM ffe) { refMul(x, y, logM) }},
 			gf16Kernel{"mulgf16XorNEON3", mulgf16XorNEON3, refMulXor},
 			gf16Kernel{"fftDIT2NEON3", fftDIT2NEON3, refFFT},
 			gf16Kernel{"ifftDIT2NEON3", ifftDIT2NEON3, refIFFT},
